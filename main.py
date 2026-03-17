@@ -218,7 +218,7 @@ def app_icon() -> QIcon:
 
 
 CATEGORY_ICON_FILES = {
-    "call": ("call.png", "call_history.png", "phone.png", "phone.ico", "phone.icns"),
+    "call": ("call.png", "call_history.png"),
     "sms": ("sms.png", "message.png", "messages.png"),
     "photos": ("photo.png", "photos.png", "image.png"),
     "voicemail": ("voice.png", "voicemail.png", "mic.png"),
