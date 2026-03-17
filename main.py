@@ -1,10 +1,12 @@
 import csv
+import gzip
 import html
 import os
 import plistlib
 import re
 import sqlite3
 import sys
+import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -27,6 +29,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from cryptography.hazmat.primitives import hashes, keywrap
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    _CRYPTO_AVAILABLE = True
+except Exception:
+    hashes = keywrap = Cipher = algorithms = modes = PBKDF2HMAC = None
+    _CRYPTO_AVAILABLE = False
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 BG = "#0a0a0f"
@@ -83,6 +94,18 @@ CONTACT_KEYWORDS = (
 )
 CONTACT_DB_EXTENSIONS = (
     ".db", ".sqlite", ".sqlite3", ".sqlitedb", ".abcddb",
+)
+NOTE_KEYWORDS = (
+    "group.com.apple.notes",
+    "notestore.sqlite",
+    "mobilenotes",
+    "/library/notes/",
+    "/notes/",
+    "com.apple.notes",
+    "notesv",
+)
+NOTE_DB_EXTENSIONS = (
+    ".db", ".sqlite", ".sqlite3", ".storedata",
 )
 ZALO_KEYWORDS = (
     "zalo",
@@ -148,6 +171,7 @@ def _resource_markers() -> tuple[str, ...]:
         "photo.png",
         "voice.png",
         "contact.png",
+        "note.png",
         "all.png",
     )
 
@@ -199,6 +223,7 @@ CATEGORY_ICON_FILES = {
     "photos": ("photo.png", "photos.png", "image.png"),
     "voicemail": ("voice.png", "voicemail.png", "mic.png"),
     "contacts": ("contact.png", "contacts.png", "addressbook.png", "person.png"),
+    "notes": ("note.png", "notes.png", "memo.png"),
     "advanced": ("all.png", "advanced.png", "shield.png", "database.png"),
     "all": ("all.png", "select_all.png"),
 }
@@ -513,6 +538,19 @@ def classify_contacts(entry) -> bool:
     if any(key in combined for key in CONTACT_KEYWORDS):
         return True
     if rel.endswith(CONTACT_DB_EXTENSIONS) and ("addressbook" in rel or "/contacts/" in combined):
+        return True
+    return False
+
+
+def classify_notes(entry) -> bool:
+    domain = (entry.domain or "").lower()
+    rel = (entry.relative_path or "").replace("\\", "/").lower()
+    combined = f"{domain}/{rel}"
+    if "notestore.sqlite" in rel or "notestore.sqlite" in combined:
+        return True
+    if any(key in combined for key in NOTE_KEYWORDS):
+        return rel.endswith(NOTE_DB_EXTENSIONS) or "group.com.apple.notes" in combined
+    if rel.endswith(".storedata") and "notes" in rel:
         return True
     return False
 
@@ -1065,6 +1103,1220 @@ def _extract_text_from_attributed_body(blob) -> str:
         if _candidate_score(candidate)[0] >= 0:
             return candidate
     return ""
+
+
+def _extract_note_text_chunks_from_bytes(raw: bytes) -> list[str]:
+    if not raw:
+        return []
+
+    try:
+        decoded = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+
+    if not decoded:
+        return []
+
+    cleaned = decoded.replace("\x00", "\n")
+    cleaned = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]+", "\n", cleaned)
+    cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    allowed_punct = "._-/:@#%&()[],'\"!?+=;*"
+    for part in re.split(r"[\n\r\t]+", cleaned):
+        part = _clean_extracted_candidate(part)
+        if not part:
+            continue
+        if _candidate_score(part)[0] < 8:
+            continue
+        weird = sum(1 for ch in part if not (ch.isalnum() or ch.isspace() or ch in allowed_punct))
+        if weird > max(4, int(len(part) * 0.08)):
+            continue
+        if len(part) > 120 and part.count(" ") < 2:
+            continue
+        if part not in seen:
+            seen.add(part)
+            out.append(part)
+    return out
+
+
+def _whole_text_candidate_from_bytes(raw: bytes) -> str:
+    if not raw:
+        return ""
+    try:
+        decoded = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    if not decoded:
+        return ""
+
+    cleaned = decoded.replace("\x00", "\n")
+    cleaned = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]+", " ", cleaned)
+    cleaned = _normalize_text(cleaned)
+    if not cleaned:
+        return ""
+
+    allowed_punct = "._-/:@#%&()[],'\"!?+=;*"
+    weird = sum(1 for ch in cleaned if not (ch.isalnum() or ch.isspace() or ch in allowed_punct))
+    if weird > max(6, int(len(cleaned) * 0.06)):
+        return ""
+    if _candidate_score(cleaned)[0] < 20:
+        return ""
+    return cleaned[:20000]
+
+
+def _inflate_note_blob_variants(raw: bytes) -> list[bytes]:
+    variants: list[bytes] = []
+    seen: set[bytes] = set()
+
+    def add(candidate):
+        if not isinstance(candidate, (bytes, bytearray)):
+            return
+        candidate = bytes(candidate)
+        if not candidate or candidate in seen:
+            return
+        seen.add(candidate)
+        variants.append(candidate)
+
+    add(raw)
+    for fn in (
+        lambda b: gzip.decompress(b),
+        lambda b: zlib.decompress(b),
+        lambda b: zlib.decompress(b, -15),
+    ):
+        try:
+            add(fn(raw))
+        except Exception:
+            pass
+    return variants
+
+
+def _decode_note_blob_text(blob) -> str:
+    if blob in (None, "", b""):
+        return ""
+
+    raw = bytes(blob) if isinstance(blob, memoryview) else blob
+    if isinstance(raw, str):
+        return _normalize_text(raw)
+    if not isinstance(raw, (bytes, bytearray)):
+        return ""
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    payloads = _inflate_note_blob_variants(bytes(raw))
+    for idx, payload in enumerate(payloads):
+        should_mine_text = idx > 0 or len(payloads) == 1
+
+        if should_mine_text:
+            whole_text = _whole_text_candidate_from_bytes(payload)
+            if whole_text and whole_text not in seen:
+                seen.add(whole_text)
+                candidates.append(whole_text)
+
+            preferred = _extract_text_from_attributed_body(payload)
+            if preferred and preferred not in seen:
+                seen.add(preferred)
+                candidates.append(preferred)
+
+            for candidate in _extract_note_text_chunks_from_bytes(payload):
+                if candidate not in seen:
+                    seen.add(candidate)
+                    candidates.append(candidate)
+
+    if not candidates:
+        return ""
+
+    strong = [c for c in candidates if _candidate_score(c)[0] >= 16 and len(c) >= 2]
+    if not strong:
+        strong = candidates
+
+    if not strong:
+        return ""
+
+    best_long = max(strong, key=lambda c: (_candidate_score(c)[0], len(c)))
+    if len(best_long) >= 140:
+        return best_long[:20000]
+
+    stitched: list[str] = []
+    total = 0
+    for item in strong:
+        duplicate = False
+        for existing in stitched:
+            if item == existing or item in existing or existing in item:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        stitched.append(item)
+        total += len(item)
+        if total >= 6000 or len(stitched) >= 18:
+            break
+
+    if not stitched:
+        return best_long[:20000]
+
+    return "\n".join(stitched)[:20000]
+
+
+def _row_pick_first(row: sqlite3.Row | dict, *candidates: str):
+    for col in candidates:
+        if hasattr(row, "keys") and col in row.keys():
+            value = row[col]
+            if value not in (None, "", b""):
+                return value
+    return None
+
+
+def _preferred_title_from_note(text: str) -> str:
+    cleaned = _normalize_text(text)
+    if not cleaned:
+        return ""
+    first_line = cleaned.splitlines()[0].strip()
+    return first_line[:120]
+
+
+def _note_preview(text: str, limit: int = 240) -> str:
+    cleaned = _normalize_text(text)
+    if not cleaned:
+        return ""
+    one_line = " ".join(part.strip() for part in cleaned.splitlines() if part.strip())
+    return one_line[:limit] + ("…" if len(one_line) > limit else "")
+
+
+def _note_signature(note: dict) -> tuple[str, str, str, str]:
+    return (
+        (note.get("title") or "").strip().casefold(),
+        (note.get("content") or "")[:500].strip().casefold(),
+        (note.get("modified") or "").strip(),
+        (note.get("source_db") or "").strip(),
+    )
+
+
+def _dedupe_notes(notes: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for note in notes:
+        content = _normalize_text(note.get("content", ""))
+        title = _normalize_text(note.get("title", "")) or _preferred_title_from_note(content) or "Untitled note"
+        snippet = _normalize_text(note.get("snippet", "")) or _note_preview(content)
+        normalized = dict(note)
+        normalized["title"] = title
+        normalized["content"] = content
+        normalized["snippet"] = snippet
+        key = _note_signature(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(normalized)
+    return out
+
+
+LOCKED_NOTE_METADATA_TERMS = (
+    "wrappedencryptionkey",
+    "encrypteddata",
+    "passphrasesalt",
+    "passphraseiterationcount",
+    "passphrasehint",
+    "cipherversion",
+    "cryptowrappedkey",
+    "cryptoinitializationvector",
+    "cryptosalt",
+    "cryptotag",
+    "cryptoiterationcount",
+)
+
+
+def _blob_bytes(value) -> bytes:
+    if value in (None, "", b""):
+        return b""
+    if isinstance(value, memoryview):
+        return bytes(value)
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, bytes):
+        return value
+    return b""
+
+
+def _int_or_zero(value) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
+def _pick_row_value(row: sqlite3.Row | dict, *patterns: str):
+    if not hasattr(row, "keys"):
+        return None
+    for pattern in patterns:
+        pattern = pattern.lower()
+        for col in row.keys():
+            if pattern in col.lower():
+                value = row[col]
+                if value not in (None, "", b""):
+                    return value
+    return None
+
+LOCKED_NOTE_REF_HINTS = (
+    "crypto",
+    "protect",
+    "password",
+    "wrapped",
+    "encrypt",
+    "salt",
+    "tag",
+    "vector",
+    "initialization",
+    "nonce",
+    "verifier",
+    "note",
+    "data",
+)
+
+
+def _coerce_positive_int(value) -> int | None:
+    try:
+        ivalue = int(value)
+    except Exception:
+        return None
+    return ivalue if ivalue > 0 else None
+
+
+def _row_has_locked_note_crypto_material(row: sqlite3.Row | dict) -> bool:
+    if not hasattr(row, "keys"):
+        return False
+    for col in row.keys():
+        lower = col.lower()
+        if any(term in lower for term in LOCKED_NOTE_METADATA_TERMS):
+            value = row[col]
+            if value not in (None, "", b"", 0, "0"):
+                return True
+    return False
+
+
+def _collect_locked_note_related_rows(
+    note_row: sqlite3.Row | dict,
+    data_ref: int | None,
+    note_data_row: sqlite3.Row | dict | None,
+    object_rows_by_pk: dict[int, sqlite3.Row],
+    all_object_rows: list[sqlite3.Row],
+) -> list[sqlite3.Row | dict]:
+    related: list[sqlite3.Row | dict] = []
+    seen_ids: set[int] = set()
+
+    def add_row(candidate):
+        if candidate is None or not hasattr(candidate, "keys"):
+            return
+        ident = id(candidate)
+        if ident in seen_ids:
+            return
+        seen_ids.add(ident)
+        related.append(candidate)
+
+    add_row(note_row)
+    add_row(note_data_row)
+
+    queue: list[int] = []
+    queued: set[int] = set()
+    backlink_targets: set[int] = set()
+
+    note_pk = _coerce_positive_int(_row_pick_first(note_row, "Z_PK"))
+    if note_pk:
+        backlink_targets.add(note_pk)
+    if data_ref:
+        backlink_targets.add(data_ref)
+
+    for source in (note_row, note_data_row):
+        if source is None or not hasattr(source, "keys"):
+            continue
+        for col in source.keys():
+            lower = col.lower()
+            if not any(hint in lower for hint in LOCKED_NOTE_REF_HINTS):
+                continue
+            ref = _coerce_positive_int(source[col])
+            if ref and ref not in queued:
+                queued.add(ref)
+                queue.append(ref)
+
+    while queue and len(related) < 32:
+        ref = queue.pop(0)
+        row = object_rows_by_pk.get(ref)
+        if row is None:
+            continue
+        add_row(row)
+        for col in row.keys():
+            lower = col.lower()
+            if not any(hint in lower for hint in LOCKED_NOTE_REF_HINTS):
+                continue
+            more_ref = _coerce_positive_int(row[col])
+            if more_ref and more_ref not in queued:
+                queued.add(more_ref)
+                queue.append(more_ref)
+
+    if backlink_targets:
+        for row in all_object_rows:
+            if len(related) >= 48:
+                break
+            if not _row_has_locked_note_crypto_material(row):
+                continue
+            for col in row.keys():
+                ref = _coerce_positive_int(row[col])
+                if ref and ref in backlink_targets:
+                    add_row(row)
+                    break
+
+    return related
+
+
+def _pick_value_from_rows(rows: list[sqlite3.Row | dict], *patterns: str):
+    for row in rows:
+        value = _pick_row_value(row, *patterns)
+        if value not in (None, "", b""):
+            return value
+    return None
+
+
+def _looks_like_locked_note_metadata(text: str) -> bool:
+    cleaned = _normalize_text(text)
+    if not cleaned:
+        return False
+    lower = cleaned.lower()
+    hits = sum(term in lower for term in LOCKED_NOTE_METADATA_TERMS)
+    if hits >= 2:
+        return True
+    return "bplist00" in lower and any(term in lower for term in LOCKED_NOTE_METADATA_TERMS)
+
+
+def _looks_like_probably_garbage_note_text(text: str) -> bool:
+    cleaned = _normalize_text(text)
+    if not cleaned:
+        return True
+    if _looks_like_locked_note_metadata(cleaned):
+        return True
+    if re.fullmatch(r"\d{6,}(?:\.\d+)?", cleaned):
+        return True
+    if cleaned.startswith("bplist00"):
+        return True
+    letters = sum(ch.isalpha() for ch in cleaned)
+    digits = sum(ch.isdigit() for ch in cleaned)
+    weird = sum(1 for ch in cleaned if not (ch.isalnum() or ch.isspace() or ch in "._-/:@#%&()[],'\"!?+=;*"))
+    if weird > max(4, int(len(cleaned) * 0.08)):
+        return True
+    if len(cleaned) <= 80 and letters < 2 and digits >= max(6, len(cleaned) - 2):
+        return True
+    score, _ = _candidate_score(cleaned)
+    return score < 12 and letters < 4
+
+
+def _meaningful_note_text(text: str) -> str:
+    cleaned = _normalize_text(text)
+    if not cleaned:
+        return ""
+    if _looks_like_probably_garbage_note_text(cleaned):
+        return ""
+    return cleaned
+
+
+def _locked_note_placeholder(passphrase_hint: str = "", decrypt_error: str = "") -> tuple[str, str]:
+    message = "Locked note. Enter the Apple Notes password and enable Unlock Locked Notes to decrypt this content."
+    if passphrase_hint:
+        message += f" Hint: {passphrase_hint}"
+    if decrypt_error:
+        message += f" Reason: {decrypt_error}"
+    return ("Locked note", message)
+
+
+def _derive_locked_note_kek(password: str, salt: bytes, iterations: int, key_length: int = 16) -> bytes:
+    if not _CRYPTO_AVAILABLE:
+        raise RuntimeError("cryptography is not installed")
+    if not password:
+        raise ValueError("Notes password is empty")
+    if not salt:
+        raise ValueError("Missing notes salt")
+    if iterations <= 0:
+        raise ValueError("Missing notes iteration count")
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=key_length,
+        salt=salt,
+        iterations=iterations,
+    )
+    return kdf.derive(password.encode("utf-8"))
+
+
+def _row_to_plain_dict(row: sqlite3.Row | dict | None) -> dict:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return dict(row)
+    if hasattr(row, "keys"):
+        return {key: row[key] for key in row.keys()}
+    return {}
+
+
+def _archive_uid_index(value) -> int | None:
+    if isinstance(value, plistlib.UID):
+        return int(value.data)
+    return _coerce_positive_int(value)
+
+
+def _parse_locked_note_archive(raw_blob: bytes) -> dict:
+    info = {
+        "encrypted_blob": b"",
+        "wrapped_key": b"",
+        "salt": b"",
+        "iterations": 0,
+        "hint": "",
+        "cipher_version": 0,
+        "object_identifier": "",
+        "archive_format": False,
+        "raw_metadata_blob": b"",
+        "raw_unauthenticated_metadata_blob": b"",
+    }
+    if not raw_blob or not isinstance(raw_blob, (bytes, bytearray)):
+        return info
+    try:
+        archive = plistlib.loads(bytes(raw_blob))
+    except Exception:
+        return info
+    if not isinstance(archive, dict):
+        return info
+    objects = archive.get("$objects")
+    top = archive.get("$top") or {}
+    if not isinstance(objects, list):
+        return info
+
+    root_idx = _archive_uid_index(top.get("root"))
+    if root_idx is None or root_idx >= len(objects):
+        return info
+    root_obj = objects[root_idx]
+    if not isinstance(root_obj, dict):
+        return info
+
+    info["archive_format"] = True
+
+    enc_idx = _archive_uid_index(root_obj.get("encryptedData"))
+    if enc_idx is not None and enc_idx < len(objects):
+        info["encrypted_blob"] = _blob_bytes(objects[enc_idx])
+
+    wrapped_idx = _archive_uid_index(root_obj.get("wrappedEncryptionKey"))
+    if wrapped_idx is not None and wrapped_idx < len(objects):
+        info["wrapped_key"] = _blob_bytes(objects[wrapped_idx])
+
+    metadata_idx = _archive_uid_index(root_obj.get("metadata"))
+    if metadata_idx is not None and metadata_idx < len(objects):
+        raw_metadata = _blob_bytes(objects[metadata_idx])
+        info["raw_metadata_blob"] = raw_metadata
+        try:
+            metadata = plistlib.loads(raw_metadata)
+        except Exception:
+            metadata = {}
+        if isinstance(metadata, dict):
+            info["salt"] = _blob_bytes(metadata.get("passphraseSalt")) or info["salt"]
+            info["iterations"] = _int_or_zero(metadata.get("passphraseIterationCount")) or info["iterations"]
+            info["hint"] = _normalize_text(metadata.get("passphraseHint")) or info["hint"]
+            info["cipher_version"] = _int_or_zero(metadata.get("cipherVersion")) or info["cipher_version"]
+            info["object_identifier"] = _normalize_text(metadata.get("objectIdentifier")) or info["object_identifier"]
+
+    unauth_idx = _archive_uid_index(root_obj.get("unauthenticatedMetadata"))
+    if unauth_idx is not None and unauth_idx < len(objects):
+        raw_unauth = _blob_bytes(objects[unauth_idx])
+        info["raw_unauthenticated_metadata_blob"] = raw_unauth
+        try:
+            unauth = plistlib.loads(raw_unauth)
+        except Exception:
+            unauth = {}
+        if isinstance(unauth, dict):
+            info["salt"] = _blob_bytes(unauth.get("passphraseSalt")) or info["salt"]
+            info["iterations"] = _int_or_zero(unauth.get("passphraseIterationCount")) or info["iterations"]
+            info["hint"] = _normalize_text(unauth.get("passphraseHint")) or info["hint"]
+            info["cipher_version"] = _int_or_zero(unauth.get("cipherVersion")) or info["cipher_version"]
+            info["object_identifier"] = _normalize_text(unauth.get("objectIdentifier")) or info["object_identifier"]
+
+    return info
+
+
+def _decrypt_locked_note_payload(encrypted_blob: bytes, password: str, rows: list[sqlite3.Row | dict]) -> dict:
+    result = {
+        "plaintext": b"",
+        "hint": "",
+        "decrypt_status": "",
+        "decrypt_error": "",
+        "password_verified": False,
+        "archive_format": False,
+    }
+    if not _CRYPTO_AVAILABLE:
+        result["decrypt_error"] = "cryptography package is required to unlock locked Notes"
+        result["decrypt_status"] = result["decrypt_error"]
+        return result
+    if not password:
+        result["decrypt_error"] = "No Notes password was provided."
+        result["decrypt_status"] = result["decrypt_error"]
+        return result
+    if not encrypted_blob:
+        result["decrypt_error"] = "Missing encrypted note payload"
+        result["decrypt_status"] = result["decrypt_error"]
+        return result
+
+    archive_info = {}
+    for row in rows:
+        row_dict = _row_to_plain_dict(row)
+        for value in row_dict.values():
+            blob = _blob_bytes(value)
+            if blob.startswith(b"bplist00"):
+                parsed = _parse_locked_note_archive(blob)
+                if parsed.get("archive_format"):
+                    archive_info = parsed
+                    break
+        if archive_info:
+            break
+
+    result["archive_format"] = bool(archive_info.get("archive_format"))
+
+    wrapped_key = archive_info.get("wrapped_key") or _blob_bytes(_pick_value_from_rows(rows, "cryptowrappedkey", "wrappedencryptionkey"))
+    salt = archive_info.get("salt") or _blob_bytes(_pick_value_from_rows(rows, "cryptosalt", "passphrasesalt"))
+    iterations = _int_or_zero(archive_info.get("iterations") or _pick_value_from_rows(rows, "cryptoiterationcount", "passphraseiterationcount", "iterationcount"))
+    iv = _blob_bytes(_pick_value_from_rows(rows, "cryptoinitializationvector", "initializationvector", " iv", "nonce"))
+    tag = _blob_bytes(_pick_value_from_rows(rows, "cryptotag", " tag", "authenticationtag"))
+    hint = _normalize_text(archive_info.get("hint") or _pick_value_from_rows(rows, "passphrasehint", "passwordhint", "hint"))
+    payload = archive_info.get("encrypted_blob") or encrypted_blob
+    result["hint"] = hint
+
+    if not wrapped_key or not salt or iterations <= 0:
+        result["decrypt_error"] = "Locked note is still missing one or more key-derivation fields in NoteStore.sqlite."
+        result["decrypt_status"] = result["decrypt_error"]
+        return result
+    if not iv or not tag:
+        result["decrypt_error"] = "Locked note is missing the IV or authentication tag in NoteStore.sqlite."
+        result["decrypt_status"] = result["decrypt_error"]
+        return result
+
+    unwrap_errors: list[str] = []
+    gcm_errors: list[str] = []
+    for key_length in (16, 32):
+        try:
+            kek = _derive_locked_note_kek(password, salt, iterations, key_length=key_length)
+            note_key = keywrap.aes_key_unwrap(kek, wrapped_key)
+            result["password_verified"] = True
+        except Exception as exc:
+            unwrap_errors.append(f"PBKDF2/AES unwrap failed with {key_length * 8}-bit KEK: {exc}")
+            continue
+
+        try:
+            decryptor = Cipher(algorithms.AES(note_key), modes.GCM(iv, tag)).decryptor()
+            plaintext = decryptor.update(payload) + decryptor.finalize()
+            result["plaintext"] = plaintext
+            result["decrypt_status"] = f"Decrypted with {key_length * 8}-bit KEK and {len(note_key) * 8}-bit note key."
+            result["decrypt_error"] = ""
+            return result
+        except Exception as exc:
+            gcm_errors.append(f"AES-GCM failed with {key_length * 8}-bit KEK / {len(note_key) * 8}-bit note key: {exc}")
+
+    if result["password_verified"]:
+        if archive_info.get("archive_format"):
+            result["decrypt_error"] = (
+                "Password was accepted and the note key unwrapped successfully, but the encrypted payload still did not decrypt. "
+                "This note uses the newer archive-based locked-note format, which is typically seen on newer Apple Notes versions "
+                "(often iOS 17+ / newer macOS builds) and is not fully decoded by this extractor yet."
+            )
+        else:
+            result["decrypt_error"] = "Password was accepted and the note key unwrapped successfully, but the encrypted payload still did not decrypt."
+        result["decrypt_status"] = result["decrypt_error"]
+        return result
+
+    result["decrypt_error"] = "Password did not verify against the locked note key."
+    if unwrap_errors:
+        result["decrypt_status"] = result["decrypt_error"]
+    else:
+        result["decrypt_status"] = result["decrypt_error"]
+    return result
+
+
+def _sanitize_note_record(title: str, snippet: str, content: str, *, password_protected: bool = False, decrypted_locked: bool = False, passphrase_hint: str = "", decrypt_error: str = "") -> dict | None:
+    title = _normalize_text(title)
+    snippet = _normalize_text(snippet)
+    content = _normalize_text(content)
+
+    if content and _looks_like_locked_note_metadata(content):
+        content = ""
+    if snippet and _looks_like_locked_note_metadata(snippet):
+        snippet = ""
+    if title and _looks_like_locked_note_metadata(title):
+        title = ""
+
+    if content and _looks_like_probably_garbage_note_text(content):
+        content = ""
+    if snippet and _looks_like_probably_garbage_note_text(snippet):
+        snippet = ""
+    if title and _looks_like_probably_garbage_note_text(title) and not _meaningful_note_text(content):
+        title = ""
+
+    if password_protected and not decrypted_locked and not content:
+        fallback_title, fallback_content = _locked_note_placeholder(passphrase_hint, decrypt_error)
+        title = title or fallback_title
+        snippet = snippet or fallback_content
+        content = fallback_content
+
+    if content:
+        title = title or _preferred_title_from_note(content)
+        snippet = snippet or _note_preview(content)
+
+    if not content and snippet and _meaningful_note_text(snippet):
+        content = snippet
+        title = title or _preferred_title_from_note(snippet)
+
+    title = _meaningful_note_text(title) or (_preferred_title_from_note(content) if content else "") or ("Locked note" if password_protected else "")
+    snippet = _meaningful_note_text(snippet) or (_note_preview(content) if content else "")
+    if content and not password_protected:
+        content = _meaningful_note_text(content)
+
+    if password_protected and not decrypted_locked and content:
+        pass
+    elif content and not _meaningful_note_text(content):
+        content = ""
+
+    if not (title or snippet or content):
+        return None
+
+    return {
+        "title": title or "Untitled note",
+        "snippet": snippet or _note_preview(content),
+        "content": content or snippet,
+    }
+
+
+def _extract_notes_from_modern_store(conn: sqlite3.Connection, source_db: str, notes_password: str = "", unlock_locked: bool = False) -> list[dict]:
+    if not _table_exists(conn, "ZICCLOUDSYNCINGOBJECT"):
+        return []
+
+    conn.row_factory = sqlite3.Row
+    object_cols = _table_columns(conn, "ZICCLOUDSYNCINGOBJECT")
+    rows = conn.execute('SELECT * FROM "ZICCLOUDSYNCINGOBJECT"').fetchall()
+    if not rows:
+        return []
+
+    note_data_by_pk: dict[int, dict[str, object]] = {}
+    if _table_exists(conn, "ZICNOTEDATA"):
+        note_cols = _table_columns(conn, "ZICNOTEDATA")
+        rows_note_data = conn.execute('SELECT * FROM "ZICNOTEDATA"').fetchall()
+        plaintext_cols = [c for c in note_cols if any(term in c.lower() for term in ("plaintext", "plain_text", "summary"))]
+        blob_cols = [c for c in note_cols if c.lower() in {"zdata", "data", "zblob"} or c.lower().endswith("data")]
+        pk_col = "Z_PK" if "Z_PK" in note_cols else None
+        for row in rows_note_data:
+            data_pk = int(row[pk_col]) if pk_col and row[pk_col] not in (None, "", b"") else None
+            text_value = ""
+            raw_blob = b""
+            for col in plaintext_cols:
+                value = row[col]
+                text_value = _normalize_text(value)
+                if text_value:
+                    break
+            for col in blob_cols:
+                blob_value = _blob_bytes(row[col])
+                if blob_value and not raw_blob:
+                    raw_blob = blob_value
+                if not text_value and blob_value:
+                    text_value = _decode_note_blob_text(blob_value)
+                if text_value and raw_blob:
+                    break
+            if data_pk is not None:
+                note_data_by_pk[data_pk] = {"text": text_value, "raw": raw_blob, "row": row}
+
+    object_rows_by_pk: dict[int, sqlite3.Row] = {}
+    for object_row in rows:
+        pk_value = _coerce_positive_int(_row_pick_first(object_row, "Z_PK"))
+        if pk_value:
+            object_rows_by_pk[pk_value] = object_row
+
+    note_ref_cols = [c for c in object_cols if "notedata" in c.lower()]
+    title_cols = [c for c in object_cols if "title" in c.lower()]
+    snippet_cols = [c for c in object_cols if any(term in c.lower() for term in ("snippet", "summary", "plaintext", "displaytext"))]
+    created_cols = [
+        c for c in (
+            "ZCREATIONDATE3", "ZCREATIONDATE2", "ZCREATIONDATE1", "ZCREATIONDATE"
+        ) if c in object_cols
+    ] + [c for c in object_cols if "creationdate" in c.lower() and c not in {"ZCREATIONDATE3", "ZCREATIONDATE2", "ZCREATIONDATE1", "ZCREATIONDATE"}]
+    modified_cols = [
+        c for c in (
+            "ZMODIFICATIONDATE1", "ZMODIFICATIONDATE", "ZFOLDERMODIFICATIONDATE"
+        ) if c in object_cols
+    ] + [
+        c for c in object_cols
+        if any(term in c.lower() for term in ("modificationdate", "updatedate", "moddate"))
+        and c not in {"ZMODIFICATIONDATE1", "ZMODIFICATIONDATE", "ZFOLDERMODIFICATIONDATE"}
+        and "lastviewed" not in c.lower()
+    ]
+    identifier_cols = [c for c in object_cols if "identifier" in c.lower()]
+    folder_cols = [c for c in object_cols if "folder" in c.lower()]
+    password_cols = [c for c in object_cols if "password" in c.lower() or "protected" in c.lower()]
+
+    folder_names: dict[int, str] = {}
+    for row in rows:
+        pk_value = _row_pick_first(row, "Z_PK")
+        if pk_value in (None, "", b""):
+            continue
+        has_note_ref = any(_row_pick_first(row, col) not in (None, "", 0, "0") for col in note_ref_cols)
+        title = ""
+        for col in ("ZTITLE2", "ZNAME", "ZTITLE1", "ZTITLE"):
+            title = _normalize_text(_row_pick_first(row, col) or "")
+            if title:
+                break
+        if not title:
+            for col in title_cols:
+                title = _normalize_text(row[col])
+                if title:
+                    break
+        if title and not has_note_ref:
+            try:
+                folder_names[int(pk_value)] = title
+            except Exception:
+                pass
+
+    parsed: list[dict] = []
+    for row in rows:
+        data_ref = None
+        for col in note_ref_cols:
+            value = _row_pick_first(row, col)
+            if value not in (None, "", 0, "0"):
+                try:
+                    data_ref = int(value)
+                except Exception:
+                    data_ref = None
+                if data_ref is not None:
+                    break
+
+        title = ""
+        for col in title_cols:
+            title = _normalize_text(row[col])
+            if title:
+                break
+
+        snippet = ""
+        for col in snippet_cols:
+            snippet = _normalize_text(row[col])
+            if snippet:
+                break
+
+        data_info = note_data_by_pk.get(data_ref or -1, {})
+        content = _normalize_text(data_info.get("text", ""))
+        raw_blob = _blob_bytes(data_info.get("raw", b""))
+
+        if not (data_ref is not None or content or title or snippet):
+            continue
+        if not data_ref and not content:
+            continue
+
+        created = ""
+        for col in created_cols:
+            created = _apple_time_to_str(row[col])
+            if created:
+                break
+
+        modified = ""
+        for col in modified_cols:
+            modified = _apple_time_to_str(row[col])
+            if modified:
+                break
+
+        identifier = ""
+        for col in identifier_cols:
+            identifier = _normalize_text(row[col])
+            if identifier:
+                break
+
+        folder_name = ""
+        for col in folder_cols:
+            folder_val = _row_pick_first(row, col)
+            if folder_val in (None, "", 0, "0"):
+                continue
+            try:
+                folder_name = folder_names.get(int(folder_val), "")
+            except Exception:
+                folder_name = ""
+            if folder_name:
+                break
+
+        password_protected = any(_is_truthy(row[col]) for col in password_cols if col in row.keys())
+        passphrase_hint = _normalize_text(_pick_row_value(row, "passphrasehint", "passwordhint", "hint"))
+        decrypt_error = ""
+        decrypt_status = ""
+        decrypted_locked = False
+
+        if password_protected:
+            content = ""
+            note_data_row = note_data_by_pk.get(data_ref or -1, {}).get("row") if data_ref is not None else None
+            related_crypto_rows = _collect_locked_note_related_rows(row, data_ref, note_data_row, object_rows_by_pk, rows)
+            decrypt_result = _decrypt_locked_note_payload(raw_blob, notes_password, related_crypto_rows) if unlock_locked else {
+                "plaintext": b"",
+                "hint": "",
+                "decrypt_status": "Unlock Locked Notes is disabled.",
+                "decrypt_error": "Locked note content was not decrypted because Unlock Locked Notes is disabled.",
+                "password_verified": False,
+                "archive_format": False,
+            }
+            if decrypt_result.get("hint") and not passphrase_hint:
+                passphrase_hint = _normalize_text(decrypt_result.get("hint"))
+            decrypt_status = _normalize_text(decrypt_result.get("decrypt_status"))
+            decrypt_error = _normalize_text(decrypt_result.get("decrypt_error"))
+            decrypted_payload = _blob_bytes(decrypt_result.get("plaintext"))
+            if decrypted_payload:
+                decrypted_text = _decode_note_blob_text(decrypted_payload)
+                decrypted_text = _normalize_text(decrypted_text)
+                if decrypted_text:
+                    content = decrypted_text
+                    decrypted_locked = True
+                    if not decrypt_status:
+                        decrypt_status = "Decrypted successfully."
+                else:
+                    decrypt_error = decrypt_error or "Decryption produced bytes, but no readable note text was reconstructed."
+                    decrypt_status = decrypt_status or decrypt_error
+            else:
+                if not decrypt_status:
+                    decrypt_status = decrypt_error or ("No Notes password was provided." if unlock_locked and not notes_password else "Locked note content was not decrypted.")
+                if not decrypt_error:
+                    decrypt_error = decrypt_status
+
+        sanitized = _sanitize_note_record(
+            title,
+            snippet,
+            content,
+            password_protected=password_protected,
+            decrypted_locked=decrypted_locked,
+            passphrase_hint=passphrase_hint,
+            decrypt_error=decrypt_error or decrypt_status,
+        )
+        if not sanitized:
+            continue
+
+        parsed.append(
+            {
+                "title": sanitized["title"],
+                "folder": folder_name,
+                "created": created,
+                "modified": modified,
+                "identifier": identifier,
+                "password_protected": "Yes" if password_protected else "",
+                "locked_status": "Decrypted" if decrypted_locked else ("Locked" if password_protected else ""),
+                "decrypt_status": decrypt_status,
+                "passphrase_hint": passphrase_hint,
+                "snippet": sanitized["snippet"],
+                "content": sanitized["content"],
+                "source_db": source_db,
+            }
+        )
+
+    return _dedupe_notes(parsed)
+
+
+
+def _choose_note_table_columns(cols: list[str]) -> dict[str, str]:
+    lower_map = {col.lower(): col for col in cols}
+
+    def pick(*patterns: str) -> str:
+        for pattern in patterns:
+            for lower, original in lower_map.items():
+                if pattern in lower:
+                    return original
+        return ""
+
+    return {
+        "pk": pick("z_pk", "pk", "note_id", "rowid", "id"),
+        "title": pick("title", "subject", "name"),
+        "body": pick("plaintext", "body", "content", "text", "html", "data"),
+        "snippet": pick("snippet", "summary"),
+        "created": pick("creationdate", "created", "createdate"),
+        "modified": pick("modificationdate", "modified", "updated", "update"),
+    }
+
+
+def _extract_notes_from_generic_tables(conn: sqlite3.Connection, source_db: str) -> list[dict]:
+    conn.row_factory = sqlite3.Row
+    parsed: list[dict] = []
+
+    for table in _sqlite_user_tables(conn):
+        cols = list(_table_columns(conn, table))
+        lower_table = table.lower()
+        score = 0
+        if "note" in lower_table:
+            score += 3
+        if any("title" in c.lower() for c in cols):
+            score += 1
+        if any(any(term in c.lower() for term in ("body", "content", "text", "plaintext", "snippet", "summary")) for c in cols):
+            score += 2
+        if score < 3:
+            continue
+
+        chosen = _choose_note_table_columns(cols)
+        select_cols = [col for col in {chosen["pk"], chosen["title"], chosen["body"], chosen["snippet"], chosen["created"], chosen["modified"]} if col]
+        if not select_cols:
+            continue
+
+        quoted_cols = ", ".join(f'"{col}"' for col in select_cols)
+        try:
+            rows = conn.execute(f'SELECT {quoted_cols} FROM "{table}" LIMIT 1000').fetchall()
+        except Exception:
+            continue
+
+        for row in rows:
+            title = _normalize_text(row[chosen["title"]]) if chosen["title"] else ""
+            snippet = _normalize_text(row[chosen["snippet"]]) if chosen["snippet"] else ""
+            content = ""
+            if chosen["body"]:
+                raw_body = row[chosen["body"]]
+                if isinstance(raw_body, (bytes, bytearray, memoryview)):
+                    content = _decode_note_blob_text(raw_body)
+                else:
+                    content = _normalize_text(raw_body)
+
+            created = _apple_time_to_str(row[chosen["created"]]) if chosen["created"] else ""
+            modified = _apple_time_to_str(row[chosen["modified"]]) if chosen["modified"] else ""
+
+            sanitized = _sanitize_note_record(title, snippet, content)
+            if not sanitized:
+                continue
+
+            parsed.append(
+                {
+                    "title": sanitized["title"],
+                    "folder": "",
+                    "created": created,
+                    "modified": modified,
+                    "identifier": "",
+                    "password_protected": "",
+                    "locked_status": "",
+                    "passphrase_hint": "",
+                    "snippet": sanitized["snippet"],
+                    "content": sanitized["content"],
+                    "source_db": f"{source_db} · {table}",
+                }
+            )
+
+    return _dedupe_notes(parsed)
+
+
+
+def _render_note_detail_page(title: str, subtitle: str, note: dict, back_href: str) -> str:
+    meta_items = []
+    for label, value in (
+        ("Folder", note.get("folder", "")),
+        ("Created", note.get("created", "")),
+        ("Modified", note.get("modified", "")),
+        ("Identifier", note.get("identifier", "")),
+        ("Protected", note.get("password_protected", "")),
+        ("Locked status", note.get("locked_status", "")),
+        ("Decrypt status", note.get("decrypt_status", "")),
+        ("Passphrase hint", note.get("passphrase_hint", "")),
+        ("Source", note.get("source_db", "")),
+    ):
+        value = _normalize_text(value)
+        if not value:
+            continue
+        meta_items.append(
+            f'<div><b>{html.escape(label)}</b><div class="detail">{html.escape(value)}</div></div>'
+        )
+
+    content = _normalize_text(note.get("content", "")) or "[No readable content extracted from this note.]"
+    fragments = [
+        f'<div class="toolbar"><a class="backlink" href="{html.escape(back_href)}">← Back to notes</a></div>',
+        '<div class="call-item">',
+        f'<div class="call-top"><div><strong>{html.escape(note.get("title") or "Untitled note")}</strong></div></div>',
+        f'<div class="kv">{"".join(meta_items)}</div>' if meta_items else '',
+        f'<div class="preview" style="margin-top:14px; white-space:pre-wrap;">{html.escape(content)}</div>',
+        '</div>',
+    ]
+    return _wrap_html_page(title, subtitle, ''.join(fragments))
+
+
+def _render_notes_index_page(title: str, subtitle: str, notes: list[dict], note: str = "") -> str:
+    body: list[str] = []
+    extra_head = """
+<style>
+.section-title { margin: 22px 0 10px; font-size: 18px; font-weight: 700; }
+.notice { padding: 14px 16px; border-radius: 16px; border: 1px solid var(--line); background: rgba(255,255,255,0.03); color: var(--muted); margin-bottom: 14px; }
+.note-card { display: block; padding: 16px 18px; border-radius: 20px; border: 1px solid var(--line); background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.015)); }
+.note-title { font-size: 18px; font-weight: 700; margin: 0 0 8px; }
+.note-meta { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+.note-preview { color: var(--text); font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+</style>
+"""
+    if note:
+        body.append(f'<div class="notice">{html.escape(note)}</div>')
+
+    body.append('<div class="section-title">Notes</div>')
+    if notes:
+        body.append('<div class="card-grid">')
+        for item in notes:
+            meta = " · ".join(
+                part for part in [
+                    item.get("folder") or "",
+                    item.get("locked_status") or "",
+                    item.get("modified") or item.get("created") or "",
+                    item.get("source_db") or "",
+                ] if part
+            )
+            preview = item.get("snippet") or _note_preview(item.get("content", ""))
+            href = item.get("href", "")
+            if href:
+                body.append(
+                    f'<a class="note-card" href="{html.escape(href)}">'
+                    f'<div class="note-title">{html.escape(item.get("title") or "Untitled note")}</div>'
+                    f'<div class="note-meta">{html.escape(meta)}</div>'
+                    f'<div class="note-preview">{html.escape(preview or "[No readable text extracted]")}</div>'
+                    f'</a>'
+                )
+            else:
+                body.append(
+                    f'<div class="note-card">'
+                    f'<div class="note-title">{html.escape(item.get("title") or "Untitled note")}</div>'
+                    f'<div class="note-meta">{html.escape(meta)}</div>'
+                    f'<div class="note-preview">{html.escape(preview or "[No readable text extracted]")}</div>'
+                    f'</div>'
+                )
+        body.append('</div>')
+    else:
+        body.append('<div class="notice">No readable Apple Notes content could be reconstructed from the extracted backup files.</div>')
+
+    return _wrap_html_page(title, subtitle, ''.join(body), extra_head=extra_head)
+
+
+def export_notes_readable(root_dir: str | Path, out_dir: str | Path, notes_password: str = "", unlock_locked: bool = False) -> int:
+    root_dir = Path(root_dir)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    db_candidates: list[Path] = []
+    for path in root_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.as_posix().lower()
+        name = path.name.lower()
+        if name == "notestore.sqlite" or ("notesv" in name and name.endswith(".storedata")):
+            db_candidates.append(path)
+            continue
+        if "group.com.apple.notes" in rel and path.suffix.lower() in NOTE_DB_EXTENSIONS:
+            db_candidates.append(path)
+
+    deduped_candidates: list[Path] = []
+    seen_candidates: set[Path] = set()
+    for candidate in db_candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen_candidates:
+            seen_candidates.add(resolved)
+            deduped_candidates.append(candidate)
+
+    notes: list[dict] = []
+    source_labels: list[str] = []
+
+    for db_path in deduped_candidates:
+        source_label = db_path.relative_to(root_dir).as_posix()
+        source_labels.append(source_label)
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            try:
+                parsed = _extract_notes_from_modern_store(conn, source_label, notes_password=notes_password, unlock_locked=unlock_locked)
+                if not parsed:
+                    parsed = _extract_notes_from_generic_tables(conn, source_label)
+            finally:
+                conn.close()
+            notes.extend(parsed)
+        except Exception:
+            continue
+
+    notes = _dedupe_notes(notes)
+    notes.sort(key=lambda item: (item.get("modified") or item.get("created") or "", item.get("title") or ""), reverse=True)
+
+    csv_path = out_dir / "notes.csv"
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["title", "folder", "created", "modified", "identifier", "password_protected", "locked_status", "decrypt_status", "passphrase_hint", "snippet", "content", "source_db"])
+        for note in notes:
+            writer.writerow([
+                note.get("title", ""),
+                note.get("folder", ""),
+                note.get("created", ""),
+                note.get("modified", ""),
+                note.get("identifier", ""),
+                note.get("password_protected", ""),
+                note.get("locked_status", ""),
+                note.get("decrypt_status", ""),
+                note.get("passphrase_hint", ""),
+                note.get("snippet", ""),
+                note.get("content", ""),
+                note.get("source_db", ""),
+            ])
+
+    txt_path = out_dir / "notes.txt"
+    with txt_path.open("w", encoding="utf-8") as fh:
+        fh.write("Apple Notes export\n")
+        fh.write("==================\n\n")
+        if source_labels:
+            fh.write("Databases found:\n")
+            for label in source_labels:
+                fh.write(f"- {label}\n")
+            fh.write("\n")
+        if not notes:
+            fh.write("No readable note text could be reconstructed from the extracted backup.\n")
+        for idx, note in enumerate(notes, start=1):
+            fh.write(f"[{idx}] {note.get('title') or 'Untitled note'}\n")
+            for label, value in (
+                ("Folder", note.get("folder", "")),
+                ("Created", note.get("created", "")),
+                ("Modified", note.get("modified", "")),
+                ("Identifier", note.get("identifier", "")),
+                ("Protected", note.get("password_protected", "")),
+                ("Locked status", note.get("locked_status", "")),
+                ("Decrypt status", note.get("decrypt_status", "")),
+                ("Passphrase hint", note.get("passphrase_hint", "")),
+                ("Source", note.get("source_db", "")),
+            ):
+                value = _normalize_text(value)
+                if value:
+                    fh.write(f"{label}: {value}\n")
+            fh.write("\n")
+            fh.write((_normalize_text(note.get("content", "")) or "[No readable content extracted]") + "\n")
+            fh.write("\n" + ("-" * 80) + "\n\n")
+
+    generated = 2
+    for idx, note in enumerate(notes, start=1):
+        slug = _safe_filename(f"{idx:03d}_{note.get('title') or 'note'}", default=f"note_{idx:03d}")
+        note_file = out_dir / f"{slug}.html"
+        note["href"] = note_file.name
+        note_file.write_text(
+            _render_note_detail_page(
+                note.get("title") or "Note",
+                note.get("snippet") or note.get("modified") or note.get("created") or "Apple Notes export",
+                note,
+                "index.html",
+            ),
+            encoding="utf-8",
+        )
+        generated += 1
+
+    note_text = (
+        "Apple Notes data is often stored as compressed protobuf blobs inside NoteStore.sqlite. "
+        "This readable export skips rows that look like binary noise, and it can attempt to decrypt locked notes when Unlock Locked Notes is enabled and the correct Notes password is provided."
+    )
+    if source_labels:
+        note_text += f" Databases found: {', '.join(source_labels[:4])}"
+        if len(source_labels) > 4:
+            note_text += " …"
+
+    index_path = out_dir / "index.html"
+    index_path.write_text(
+        _render_notes_index_page(
+            "Notes",
+            f"{len(notes)} readable note(s) reconstructed",
+            notes,
+            note=note_text,
+        ),
+        encoding="utf-8",
+    )
+    generated += 1
+
+    return generated
 
 
 def _message_display_text(row: sqlite3.Row | dict) -> str:
@@ -3350,12 +4602,14 @@ class DecryptWorker(QObject):
     progress_busy = Signal(bool)
     finished = Signal(bool, int)
 
-    def __init__(self, folder: str, password: str, output: str, opts: dict[str, bool]):
+    def __init__(self, folder: str, password: str, output: str, opts: dict[str, bool], notes_password: str = "", unlock_locked_notes: bool = False):
         super().__init__()
         self.folder = folder
         self.password = password
         self.output = output
         self.opts = opts
+        self.notes_password = notes_password
+        self.unlock_locked_notes = unlock_locked_notes
         self.done_files = 0
         self.done_steps = 0
         self.total_steps = max(sum(1 for v in opts.values() if v), 1)
@@ -3468,6 +4722,20 @@ class DecryptWorker(QObject):
                 preserve_domain=True,
                 postprocess=lambda p: export_contacts_readable(p, os.path.join(self.output, "contacts_readable")),
             )
+        if self.opts.get("notes"):
+            bulk(
+                "Notes",
+                os.path.join(self.output, "notes"),
+                classify_notes,
+                preserve_domain=True,
+                postprocess=lambda p: export_notes_readable(
+                    p,
+                    os.path.join(self.output, "notes_readable"),
+                    notes_password=self.notes_password,
+                    unlock_locked=self.unlock_locked_notes,
+                ),
+                postprocess_even_if_empty=True,
+            )
         if self.opts.get("voicemail"):
             bulk(
                 "Voicemail",
@@ -3485,6 +4753,7 @@ class App(QMainWindow):
         ("sms", "SMS & iMessage", "💬"),
         ("photos", "Photos", "🖼"),
         ("contacts", "Contacts", "👤"),
+        ("notes", "Notes", "📝"),
         ("voicemail", "Voicemail", "🎙"),
     ]
 
@@ -3740,6 +5009,24 @@ class App(QMainWindow):
         c.addWidget(self.password_input)
         c.addWidget(divider())
 
+        notes_pw_row = QHBoxLayout()
+        notes_pw_row.addWidget(QLabel("Notes Password"))
+        notes_pw_row.addStretch(1)
+        self.show_notes_pw = QCheckBox("Show")
+        self.show_notes_pw.toggled.connect(self._toggle_notes_pw)
+        notes_pw_row.addWidget(self.show_notes_pw)
+        c.addLayout(notes_pw_row)
+
+        self.notes_password_input = QLineEdit()
+        self.notes_password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.notes_password_input.setPlaceholderText("Optional: password for locked Apple Notes")
+        c.addWidget(self.notes_password_input)
+
+        self.unlock_locked_notes_cb = QCheckBox("Unlock Locked Notes")
+        self.unlock_locked_notes_cb.setChecked(True)
+        c.addWidget(self.unlock_locked_notes_cb)
+        c.addWidget(divider())
+
         hint = QLabel(
             "Auto Find scans standard Apple backup folders. You can still browse manually. "
             "If you choose a parent folder, the app will try to resolve the latest valid backup inside it."
@@ -3828,7 +5115,7 @@ class App(QMainWindow):
         right.addWidget(self.extract_hint)
 
         self.extract_note = QLabel(
-            "SMS, Call History, Contacts, and Voicemail will also generate readable HTML/TXT/CSV reports so you do not have to inspect raw SQLite / plist files directly."
+            "SMS, Call History, Contacts, Notes, and Voicemail will also generate readable HTML/TXT/CSV reports so you do not have to inspect raw SQLite / plist files directly. Locked Apple Notes can also be decrypted when Unlock Locked Notes is enabled and the correct Notes password is entered."
         )
         self.extract_note.setWordWrap(True)
         self.extract_note.setStyleSheet(f"color:{TEXT_DIM}; font-size:12px;")
@@ -3948,7 +5235,7 @@ class App(QMainWindow):
     def _show_about_dialog(self):
         about_text = (
             "iPhone backup Decryptor by Andy Le 0868231181\n\n"
-            "Use Apple Devices to create a local iPhone backup, then unlock it here and extract readable files such as SMS, call history, contacts, photos, and voicemail."
+            "Use Apple Devices to create a local iPhone backup, then unlock it here and extract readable files such as SMS, call history, contacts, notes, photos, and voicemail."
         )
         self._show_message("About This App", about_text)
 
@@ -3996,6 +5283,11 @@ class App(QMainWindow):
 
     def _toggle_pw(self, checked: bool):
         self.password_input.setEchoMode(
+            QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+        )
+
+    def _toggle_notes_pw(self, checked: bool):
+        self.notes_password_input.setEchoMode(
             QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
         )
 
@@ -4130,6 +5422,8 @@ class App(QMainWindow):
             self.password_input.text(),
             self._real_output,
             opts,
+            notes_password=self.notes_password_input.text(),
+            unlock_locked_notes=self.unlock_locked_notes_cb.isChecked(),
         )
         self._decrypt_worker.moveToThread(self._decrypt_thread)
         self._decrypt_thread.started.connect(self._decrypt_worker.run)
