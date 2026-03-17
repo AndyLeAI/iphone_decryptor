@@ -90,4 +90,4 @@ Facebook: facebook.com/ndle2
 
 ---
 
-If you publish this on GitHub, you should also add a separate `LICENSE` file with the MIT license text.
+
